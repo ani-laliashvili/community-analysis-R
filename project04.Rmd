@@ -1,0 +1,368 @@
+---
+title: "Project 04"
+output:
+  html_document:
+    theme: cosmo
+    highlight: zenburn
+    css: "note-style.css"
+---
+
+```{r, include=FALSE, message=FALSE}
+library(tidyverse)
+library(ggrepel)
+library(smodels)
+library(stringi)
+library(lubridate)
+library(sf)
+library(units)
+library(RcppRoll)
+library(hms)
+
+theme_set(theme_minimal())
+options(dplyr.summarise.inform = FALSE)
+options(width = 77L)
+options(lubridate.week.start = 1)
+Sys.setlocale(locale = "en_US.UTF-8")
+
+sm_centroid <- function(data) {
+  suppressWarnings({ z <- st_coordinates(st_centroid(data)) })
+  return(tibble(lon = z[,1], lat = z[,2]))
+}
+spatial_join <- function(...) {
+  return(st_as_sf(as_tibble(st_join(...))))
+}
+
+comarea <- read_sf(file.path("data", "chicago_community_areas.geojson"))
+ziparea <- read_sf(file.path("data", "zip_codes.geojson"))
+socio <- read_csv(file.path("data", "census_socioeconomic.csv"))
+medical <- read_csv(file.path("data", "chicago_medical_examiner_cases.csv.gz"))
+crimes <- read_rds(file.path("data", "chicago_crimes_2001_2020_sample.rds"))
+#crimes <- bind_rows(
+#  read_csv(file.path("data", "chicago_crimes_2001_2011.csv.gz")),
+#  read_csv(file.path("data", "chicago_crimes_2012_2020.csv.gz"))
+#)
+schools <- read_sf(file.path("data", "chicago_schools.geojson"))
+police <- read_sf(file.path("data", "chicago_police_stations.geojson"))
+```
+
+## Overview
+
+See the project description for instructions. The final output will be
+this RMarkdown file *knit* into HTML. More detailed instructions are given
+on the Project 4 page linked to from the course website.
+
+**Project Team**: Ani Laliashvili, John Cruz, Anna Cheng, Elize Herrenkohl
+
+**Community Area**: Lincoln Park
+ 
+**Crime Type** Theft
+
+## Project 04
+
+```{r}
+comarea_demog <- comarea %>%
+  left_join(socio, by = c("comarea", "comarea_name"))
+
+comarea_lincoln_park <- comarea_demog %>%
+  filter(comarea_name == "Lincoln Park")
+```
+
+### Description of Community Area
+
+```{r}
+comarea_demog %>%
+  ggplot() +
+    geom_sf(aes(fill = income)) +
+    geom_sf(aes(fill = income), color = "black", size = .5, 
+            data = comarea_lincoln_park, show.legend = FALSE) +
+    scale_fill_distiller(palette = "Spectral", guide = "legend", name = "Income", 
+                         n.breaks = 10) +
+    labs(
+      title = "Community Area Information",
+      subtitle = "Average Income per Community Area"
+    )
+```
+
+This map shows average income per community area in Chicago. Lincoln Park is outlined in black. We can see that our area is on the higher end of the income spectrum for community areas in Chicago. It is not the wealthiest, but has significantly higher average incomes than other community areas.
+
+```{r}
+comarea_demog %>%
+  ggplot() +
+  geom_sf(aes(fill = hardship_index)) +
+  geom_sf(aes(fill = hardship_index), color = "black", size = .5, 
+          data = comarea_lincoln_park, show.legend = FALSE) +
+  scale_fill_distiller(palette = "Spectral", guide = "legend", 
+                       name = "Hardship Index", n.breaks = 10) +
+  labs(
+    title = "Chicago Hardship Index",
+    subtitle = "Hardship Index by Community Area"
+  ) 
+```
+
+This map shows the hardship indexes for community areas across Chicago. As you can see, the community areas with the lower hardship index are concentrated on the northeast side of the city. Lincoln Park has one of the lowest hardship indexes (2), the highest hardship indexes are concentrated on the lower south side of the city, these also happen to be the community areas with the lowest average income.
+
+```{r}
+comarea_demog %>%
+  ggplot(aes(hh_poverty, income)) +
+  geom_point(color = "grey40") +
+  geom_point(data = comarea_lincoln_park, color = "red") +
+  geom_text_repel(data = comarea_lincoln_park, label = "Lincoln Park") +
+  labs(
+    title = "Community Area Information",
+    subtitle = "Chicago Income and Poverty Rates",
+    x = "Percentage of Households Below the Poverty Line",
+    y = "Average Income"
+  ) +
+  theme_sm()
+```
+
+This plot shows average community area vs the percentage of households in that community area that are below the poverty line. As one would expect, this is a rather linear relationship, as community areas that have a lower average income also have more households below the poverty line. This plot shows Lincoln park with a high average income and a lower percentage of households below the poverty line. This plot also hows how average income might not be the best statistic of income as about 10% of Lincoln Park households are below the poverty line, even with a total average income of ~$70,000.
+
+```{r}
+socio_lp <- socio %>%
+  filter(comarea == 7)
+socio %>%
+  ggplot() +
+  geom_point(aes(family_households, num_households), color = "grey40") +
+  geom_point(aes(family_households, num_households), data = socio_lp, 
+             color = "red") +
+  geom_text_repel(aes(family_w_kids, num_households), label = "Lincoln Park", 
+                  data = socio_lp) +
+  labs(
+    title = "Chicago Demographics",
+    subtitle = "Household and Family Information",
+    x = "% Family Households",
+    y = "Number of Househoulds"
+    ) +
+  theme_sm()
+``` 
+
+This plot shows the number of households in a community area and the percentage of those households that are families. There isn't a clear correlation between these two variables, but we see that Lincoln Park has a higher number of households relative to the rest of Chicago with a lower percentage of those households being families.
+
+
+### Crime Rate
+
+```{r}
+crimes_demog <- crimes %>%
+  left_join(socio, by = ("comarea"))
+```
+
+```{r}
+lp_hour <- crimes_demog %>%
+  mutate(year = year(date_iso)) %>%
+  mutate(hour = hour(date_iso)) %>%
+  filter(comarea == 7) %>%
+  filter(between(year, 2003, 2019)) %>%
+  group_by(hour, population) %>%
+  summarize(sm_count()) %>%
+  mutate(crime_perc_hour = (count / population) * 100) %>%
+  mutate(date = make_datetime(hour = hour))
+
+socio %>%
+  mutate(total_pop = sum(population)) %>%
+  right_join(crimes, by = "comarea") %>%
+  mutate(year = year(date_iso)) %>%
+  mutate(hour = hour(date_iso)) %>%
+  filter(between(year, 2003, 2019)) %>%
+  group_by(hour, total_pop) %>%
+  mutate(sm_count()) %>%
+  group_by(hour) %>%
+  slice(1) %>%
+  mutate(crime_perc_hour = (count / total_pop) * 100) %>%
+  mutate(date = make_datetime(hour = hour)) %>%
+  ggplot() +
+    geom_line(aes(date, crime_perc_hour, color = "Chicago")) + 
+    geom_line(aes(date, crime_perc_hour, color = "Lincoln Park"), 
+              data = lp_hour) + 
+    labs(
+       title = 'Crime Rate by Hour, 2003 - 2019',
+       x = "Hour (Military Time)",
+       y = "Crime rate as percentage of population"
+       ) +
+    scale_x_datetime(date_labels = "%H", date_breaks = "hour") +
+    scale_color_viridis_d(name = "Area") +
+    theme_sm()
+```
+
+We see that the overall crime rate in Lincoln Park is uniformly lower for Lincoln Park than the Chicago area. In both analyses, the lowest rates occur around early morning and the highest in the afternoon and evening. We suspect the peaks at noon and midnight are evidence of systematic reporting errors.
+
+```{r}
+lp_month <- crimes_demog %>%
+  mutate(year = year(date_iso)) %>%
+  mutate(month = month(date_iso)) %>%
+  filter(comarea == 7) %>%
+  filter(between(year, 2003, 2019)) %>%
+  group_by(month, population) %>%
+  summarize(sm_count()) %>%
+  mutate(crime_perc_month = (count / population) * 100) %>%
+  mutate(date = make_date(month = month))
+
+socio %>%
+  mutate(total_pop = sum(population)) %>%
+  right_join(crimes, by = "comarea") %>%
+  mutate(year = year(date_iso)) %>%
+  mutate(month = month(date_iso)) %>%
+  filter(between(year, 2003, 2019)) %>%
+  group_by(month, total_pop) %>%
+  mutate(sm_count()) %>%
+  group_by(month) %>%
+  slice(1) %>%
+  mutate(crime_perc_month = (count / total_pop) * 100) %>%
+  mutate(date = make_date(month = month)) %>%
+  ggplot() +
+    geom_line(aes(date, crime_perc_month, color = "Chicago")) + 
+    geom_line(aes(date, crime_perc_month, color = "Lincoln Park"), 
+              data = lp_month) + 
+    labs(
+       title = 'Crime Rate by Month, 2003 - 2019',
+       x = "Month",
+       y = "Crime rate as percentage of population"
+    ) +
+    theme_sm() +
+    scale_x_date(date_labels = "%b", date_breaks = "month") +
+    scale_color_viridis_d(name = "Area")
+```
+
+Again, the overall crime rate is uniformly lower for Lincoln Park than the overall area. In both analyses, the crime rates dip around December with a notable drop in February, and rise in March, peaking in July.
+
+```{r}
+lp_year <- crimes_demog %>%
+  mutate(year = year(date_iso)) %>%
+  filter(comarea == 7) %>%
+  filter(between(year, 2003, 2019)) %>%
+  group_by(year, population) %>%
+  summarize(sm_count()) %>%
+  mutate(crime_perc_year = (count / population) * 100)
+
+socio %>%
+  mutate(total_pop = sum(population)) %>%
+  right_join(crimes, by = "comarea") %>%
+  mutate(year = year(date_iso)) %>%
+  filter(between(year, 2003, 2019)) %>%
+  group_by(year, total_pop) %>%
+  mutate(sm_count()) %>%
+  group_by(year) %>%
+  slice(1) %>%
+  mutate(crime_perc_year = (count / total_pop) * 100) %>%
+  ggplot() +
+    geom_line(aes(year, crime_perc_year, color = "Chicago")) + 
+    geom_line(aes(year, crime_perc_year, color = "Lincoln Park"), 
+              data = lp_year) + 
+    labs(
+       title = 'Crime Rate by Year, 2003 - 2019',
+       y = "Year",
+       x = "Crime rate as percentage of population"
+    ) +
+    theme_sm() +
+    scale_color_viridis_d(name = "Area")
+```
+
+Again, the overall crime rate is uniformly lower for Lincoln Park than the overall area. Both analyses show that the crime rate has decreased from 2003-2015. The crime rate has been steady from 2015-2019 in the overall area, but seems to have risen slightly in Lincoln Park.
+
+### Multivariate Analysis
+
+```{r}
+crimes %>%
+  mutate(area = if_else(comarea == 7, "Lincoln Park", "Other")) %>%
+  filter(primary_type == 'THEFT') %>%
+  mutate(hour = hour(date_iso)) %>%
+  group_by(hour, area) %>%
+  mutate(is_500under = as.numeric(description == "$500 AND UNDER")) %>%
+  summarize(is500under_perc = mean(is_500under)) %>%
+  ggplot(aes(hour, is500under_perc, color = area)) +
+    geom_point() +
+    geom_line() +
+    theme_sm() +
+    labs(
+       title = 'Arrest Percentage of $500 and Less Theft By the Hour',
+       x = "Hour of Day",
+       y = "Percentage of Arrests",
+       color = "Areas"
+       ) +
+    scale_color_viridis_d()
+```
+
+When comparing theft of $500 and less between Lincoln Park and the rest of Chicago, it is reinforcing what we already know about the community area which is that it is a pretty safe place. The trends between Lincoln Park and the rest of Chicago seem to follow each other. One variation is that at the early hours in Lincoln Park, this type of theft jumps.
+
+```{r}
+crimes %>%
+  mutate(area = if_else(comarea == 7, "Lincoln Park", "Other")) %>%
+  filter(primary_type == 'THEFT') %>%
+  mutate(hour = hour(date_iso)) %>%
+  group_by(hour, area) %>%
+  mutate(is_pursesnatch = as.numeric(description == "PURSE-SNATCHING")) %>%
+  summarize(pursesnatch_perc = mean(is_pursesnatch)) %>%
+  ggplot(aes(hour, pursesnatch_perc, color = area)) +
+    geom_point() +
+    geom_line() +
+    theme_sm() +
+    labs(
+       title = 'Arrest Percentage of Purse Snatching By the Hour',
+       x = "Hour of Day",
+       y = "Percentage of Arrests",
+       color = "Areas"
+       ) +
+    scale_color_viridis_d()
+```
+
+There isn't much purse snatching that happens in Lincoln Park but it seems that the most purse snatching happens in the morning. This could possibly be explained by working women being targeted by people at those hours because no one is around to help. It is interesting to see how Lincoln Park's purse snatching rates exceed those of Chicago at 4am.
+
+### COVID-19
+
+```{r}
+crimes %>%
+  left_join(socio, by = "comarea") %>% 
+  mutate(year = year(date_iso)) %>%
+  filter(comarea == "7" & year >= 2019 & primary_type == 'THEFT') %>%
+  mutate(month = month(date_iso)) %>%
+  group_by(year, month, population) %>%
+  summarize(sm_count()) %>%
+  mutate(crime_rate = count*1000 / population) %>%
+  mutate(month2 = make_datetime(year, month, 1)) %>%
+  ggplot() +
+    geom_point(aes(month2, crime_rate)) +
+    geom_line(aes(month2, crime_rate)) +
+    scale_x_datetime(
+      date_breaks = "3 months",
+      date_minor_breaks = "3 months",
+      date_labels = "%Y-%m"
+    ) +
+    scale_y_continuous(limits = c(0, NA)) +
+    theme_sm() +
+    labs(
+    title = "Monthly Theft Rate For Lincoln Park",
+    subtitle = "2019-2020",
+      x = "Month",
+      y = "Crime Rate"
+    )
+```
+
+Here we plot the number of crimes for each month from January 2019 through the end of the dataset in Lincoln Park for Theft. We can see on the plot that theft decreased significantly in April 2020 and went back up to its normal levels in August 2020, only to significantly decrease again in September 2020. Clearly the pandemic has affected the crime rate.
+
+```{r}
+crimes %>%
+  left_join(socio, by = "comarea") %>% 
+  mutate(year = as.factor(year(date_iso))) %>%
+  mutate(month = month(date_iso)) %>%
+  mutate(hour = hour(date_iso)) %>%
+  mutate(hour = make_datetime(hour = hour)) %>%
+  filter((year == 2019 | year == 2020) & comarea == "7" & 
+           primary_type == 'THEFT' & (month == 6 | month == 7 | month == 8)) %>%
+  group_by(hour, population, year) %>%
+  summarize(sm_count()) %>%
+  mutate(crime_rate = count * 1000 / population) %>%
+  ggplot() +
+    geom_point(aes(hour, crime_rate, color = year), alpha = 0.7) +
+    geom_line(aes(hour, crime_rate, color = year), alpha = 0.7) +
+    theme_sm() +
+    labs(
+    title = "Hourly Theft Rate For Lincoln Park",
+    subtitle = "Summers 2019-2020",
+      x = "Hour",
+      y = "Crime Rate",
+    color = "Year"
+    ) +
+    scale_x_datetime(date_labels = "%H", date_breaks = "hour") +
+    scale_color_viridis_d(labels = c("2019", "2020"))
+```
+This plot shows us the difference in hourly theft rates in the summer of 2019 compared to that of the summer 2020 both in Lincoln Park. In the summer of 2020 we see that crime rate for theft decreases significantly. This is likely due to curfews and closure of cafes, restaurants and other evening entertainment venues.
